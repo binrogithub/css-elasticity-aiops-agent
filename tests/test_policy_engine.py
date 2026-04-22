@@ -5,14 +5,14 @@ from app.services.policy_engine import apply_execution_policy
 
 
 def test_recommend_only_records_without_mutation():
-    request = ActionRequest(action="scale_out", node_type="ess-client", delta=1, reason="pressure")
+    request = ActionRequest(action="scale_out", node_type="ess", delta=1, reason="pressure")
     decision = apply_execution_policy(request, Settings(AGENT_RUN_MODE="recommend-only"))
     assert decision.status == "dry_run"
     assert not decision.request.approved
 
 
 def test_auto_execute_requires_mutation_enabled():
-    request = ActionRequest(action="scale_out", node_type="ess-client", delta=1, reason="pressure")
+    request = ActionRequest(action="scale_out", node_type="ess", delta=1, reason="pressure")
     decision = apply_execution_policy(
         request,
         Settings(AGENT_RUN_MODE="auto-execute", CSS_MUTATION_ENABLED=False),
@@ -21,7 +21,7 @@ def test_auto_execute_requires_mutation_enabled():
 
 
 def test_approval_required_accepts_matching_payload():
-    request = ActionRequest(action="scale_out", node_type="ess-client", delta=1, reason="pressure")
+    request = ActionRequest(action="scale_out", node_type="ess", delta=1, reason="pressure")
     decision = apply_execution_policy(
         request,
         Settings(AGENT_RUN_MODE="approval-required"),
@@ -31,8 +31,8 @@ def test_approval_required_accepts_matching_payload():
     assert decision.request.approved
 
 
-def test_large_cluster_allows_client_scale_out_auto_execute():
-    request = ActionRequest(action="scale_out", node_type="ess-client", delta=1, reason="qps surge")
+def test_large_cluster_allows_data_scale_out_auto_execute():
+    request = ActionRequest(action="scale_out", node_type="ess", delta=4, reason="business growth")
     decision = apply_execution_policy(
         request,
         Settings(
@@ -45,8 +45,8 @@ def test_large_cluster_allows_client_scale_out_auto_execute():
     assert decision.request.change_plan.risk_level == "low"
 
 
-def test_large_cluster_data_scale_in_requires_approval():
-    request = ActionRequest(action="scale_in", node_type="ess", delta=1, reason="low load")
+def test_large_cluster_data_scale_in_auto_executes_when_capacity_safe():
+    request = ActionRequest(action="scale_in", node_type="ess", delta=4, reason="business decline")
     decision = apply_execution_policy(
         request,
         Settings(
@@ -57,9 +57,9 @@ def test_large_cluster_data_scale_in_requires_approval():
         ),
         low_load_minutes=180,
     )
-    assert decision.status == "approval_required"
-    assert decision.request.change_plan.risk_level == "high"
-    assert decision.request.change_plan.maintenance_window_required
+    assert decision.status == "approved"
+    assert decision.request.change_plan.risk_level == "medium"
+    assert not decision.request.change_plan.maintenance_window_required
 
 
 def test_scale_in_requires_low_load_window():
@@ -103,3 +103,21 @@ def test_capacity_analysis_blocks_data_scale_in():
     )
     assert decision.status == "blocked"
     assert "capacity analysis" in decision.message
+
+
+def test_conservative_profile_requires_longer_data_scale_in_window():
+    request = ActionRequest(action="scale_in", node_type="ess", delta=1, reason="low load")
+    decision = apply_execution_policy(
+        request,
+        Settings(
+            AGENT_RUN_MODE="auto-execute",
+            CSS_MUTATION_ENABLED=True,
+            ELASTICITY_STRATEGY_PROFILE="conservative",
+            AUTO_EXECUTE_NODE_TYPES="ess",
+            APPROVAL_REQUIRED_ACTIONS="",
+        ),
+        low_load_minutes=30,
+    )
+
+    assert decision.status == "approval_required"
+    assert "120 minutes" in decision.message

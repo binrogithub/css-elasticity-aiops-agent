@@ -7,6 +7,10 @@ from typing import Any
 from app.config import Settings
 from app.models.actions import ActionRequest
 from app.models.decisions import AIDecision
+from app.services.strategy_profile import (
+    effective_data_scale_in_cooldown_minutes,
+    effective_data_scale_out_cooldown_minutes,
+)
 
 
 DEFAULT_NODE_TYPES = ("ess", "ess-client", "ess-master")
@@ -61,8 +65,6 @@ def allowed_scale_in_delta(node_type: str, current: int, requested: int, limits:
             return 0
         return max(0, min(requested, current - targets[-1]))
     allowed = max(0, current - int(limits.get("min", 0)))
-    if node_type == "ess":
-        allowed = min(allowed, max(0, (current - 1) // 2))
     return min(requested, allowed)
 
 
@@ -76,6 +78,10 @@ def apply_delta_cap(action: str, node_type: str, requested: int, settings: Setti
         ("scale_in", "ess"): settings.css_data_scale_in_max_delta,
     }
     max_delta = int(max_deltas.get((action, node_type), 0))
+    if action == "scale_out" and node_type == "ess":
+        min_delta = max(1, int(settings.css_data_scale_out_min_delta))
+        max_delta = max(min_delta, max_delta)
+        requested = max(requested, min_delta)
     if max_delta <= 0:
         return requested
     return min(requested, max_delta)
@@ -87,8 +93,8 @@ def cooldown_minutes_for_action(decision: AIDecision, settings: Settings | None)
     overrides = {
         ("scale_out", "ess-client"): settings.css_client_scale_out_cooldown_minutes,
         ("scale_in", "ess-client"): settings.css_client_scale_in_cooldown_minutes,
-        ("scale_out", "ess"): settings.css_data_scale_out_cooldown_minutes,
-        ("scale_in", "ess"): settings.css_data_scale_in_cooldown_minutes,
+        ("scale_out", "ess"): effective_data_scale_out_cooldown_minutes(settings),
+        ("scale_in", "ess"): effective_data_scale_in_cooldown_minutes(settings),
     }
     return max(0, int(overrides.get((decision.decision, decision.node_type), decision.cooldown_minutes)))
 

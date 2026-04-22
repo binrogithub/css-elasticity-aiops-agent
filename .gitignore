@@ -1,10 +1,15 @@
 .env
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
+
 data/
+*.sqlite
 *.sqlite3
 *.db
+*.log
 
+.DS_Store

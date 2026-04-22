@@ -3,6 +3,7 @@
 from app.models.metrics import MetricsSnapshot
 from app.runtime import Runtime
 from app.services.capacity_analyzer import analyze_capacity
+from app.services.strategy_profile import effective_scale_in_low_load_minutes
 from app.services.validation import build_node_limits
 from app.state import AgentState
 
@@ -19,6 +20,7 @@ def collect_metrics_node(runtime: Runtime):
         available_flavors = runtime.executor.available_flavors()
         node_limits = build_node_limits(runtime.settings)
         diagnostics = runtime.diagnostics_provider.collect()
+        snapshot, node_summary = merge_realtime_node_metrics(snapshot, diagnostics.nodes)
         snapshot, realtime_summary = merge_realtime_opensearch_metrics(
             snapshot,
             diagnostics.search_stats,
@@ -52,12 +54,56 @@ def collect_metrics_node(runtime: Runtime):
                 "traffic_entry_mode": runtime.settings.css_traffic_entry_mode,
                 "client_scale_in_allowed": runtime.settings.css_client_scale_in_allowed,
                 "enterprise_policy_profile": runtime.settings.enterprise_policy_profile,
-                "opensearch_realtime_summary": realtime_summary,
-                "scale_in_low_load_minutes": runtime.settings.scale_in_low_load_minutes,
+                "opensearch_realtime_summary": f"{node_summary} {realtime_summary}".strip(),
+                "scale_in_low_load_minutes": effective_scale_in_low_load_minutes(runtime.settings),
             },
         )
 
     return node
+
+
+def merge_realtime_node_metrics(snapshot: MetricsSnapshot, nodes: list[dict]) -> tuple[MetricsSnapshot, str]:
+    if not nodes:
+        return snapshot, "OpenSearch realtime node CPU unavailable."
+
+    data_nodes = [
+        item
+        for item in nodes
+        if "d" in str(item.get("node.role", "")) or "data" in str(item.get("roles", ""))
+    ]
+    if not data_nodes:
+        return snapshot, "OpenSearch realtime Data node CPU unavailable."
+
+    cpus = [_safe_float(item.get("cpu")) for item in data_nodes]
+    heaps = [_safe_float(item.get("heap.percent")) for item in data_nodes]
+    cpus = [item for item in cpus if item is not None]
+    heaps = [item for item in heaps if item is not None]
+    if not cpus and not heaps:
+        return snapshot, "OpenSearch realtime Data node CPU/JVM values unavailable."
+
+    realtime_cpu = sum(cpus) / len(cpus) if cpus else snapshot.cpu_avg
+    realtime_heap = sum(heaps) / len(heaps) if heaps else snapshot.jvm_heap_avg
+    merged = snapshot.model_copy(
+        update={
+            "cpu_avg": max(snapshot.cpu_avg, realtime_cpu),
+            "jvm_heap_avg": max(snapshot.jvm_heap_avg, realtime_heap),
+        }
+    )
+    return (
+        merged,
+        f"OpenSearch realtime Data nodes={len(data_nodes)}, "
+        f"data_cpu_avg={realtime_cpu:.1f}, data_cpu_max={max(cpus) if cpus else 0:.1f}, "
+        f"data_jvm_avg={realtime_heap:.1f}.",
+    )
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def merge_realtime_opensearch_metrics(

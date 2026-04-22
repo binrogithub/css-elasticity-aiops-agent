@@ -1,7 +1,7 @@
 from app.models.decisions import AIDecision
 from app.services.validation import decision_to_action
 from app.config import Settings
-from app.executors.css_executor import CSSExecutor
+from app.executors.css_executor import CSSExecutor, _is_data_half_shrink_error
 
 
 def test_scale_out_clamped_to_max_nodes():
@@ -66,6 +66,34 @@ def test_client_scale_out_max_delta_caps_ai_recommendation():
     assert action.delta == 5
 
 
+def test_data_scale_out_min_and_max_delta_are_configurable():
+    action, _, status = decision_to_action(
+        AIDecision(decision="scale_out", node_type="ess", delta=1, reason="pressure", cooldown_minutes=30),
+        current_nodes=20,
+        min_nodes=1,
+        max_nodes=200,
+        cooldown_until=None,
+        topology={"node_types": {"ess": {"count": 20}}},
+        node_limits={"ess": {"min": 1, "max": 200}},
+        settings=Settings(CSS_DATA_SCALE_OUT_MIN_DELTA=5, CSS_DATA_SCALE_OUT_MAX_DELTA=10),
+    )
+    assert status == "validated"
+    assert action.action == "scale_out"
+    assert action.delta == 5
+
+    capped, _, _ = decision_to_action(
+        AIDecision(decision="scale_out", node_type="ess", delta=50, reason="pressure", cooldown_minutes=30),
+        current_nodes=20,
+        min_nodes=1,
+        max_nodes=200,
+        cooldown_until=None,
+        topology={"node_types": {"ess": {"count": 20}}},
+        node_limits={"ess": {"min": 1, "max": 200}},
+        settings=Settings(CSS_DATA_SCALE_OUT_MIN_DELTA=1, CSS_DATA_SCALE_OUT_MAX_DELTA=10),
+    )
+    assert capped.delta == 10
+
+
 def test_scale_in_clamped_to_min_nodes():
     action, _, _ = decision_to_action(
         AIDecision(decision="scale_in", node_type="ess-client", delta=3, reason="test", cooldown_minutes=30),
@@ -114,7 +142,7 @@ def test_client_scale_in_blocked_without_load_balancer():
     assert action.action == "hold"
 
 
-def test_data_scale_in_blocked_by_default():
+def test_data_scale_in_allowed_by_default():
     action, _, status = decision_to_action(
         AIDecision(decision="scale_in", node_type="ess", delta=1, reason="low load", cooldown_minutes=30),
         current_nodes=4,
@@ -125,15 +153,28 @@ def test_data_scale_in_blocked_by_default():
         node_limits={"ess": {"min": 3, "max": 5}},
         settings=Settings(),
     )
-    assert status == "blocked"
-    assert action.action == "hold"
+    assert status == "validated"
+    assert action.action == "scale_in"
+    assert action.delta == 1
 
 
-def test_data_node_shrink_removes_less_than_half():
+def test_data_node_shrink_not_limited_by_half_rule():
     executor = CSSExecutor.__new__(CSSExecutor)
     executor.settings = Settings(CSS_NODE_TYPE="ess")
-    assert executor._bounded_delta("scale_in", 1, current_nodes=2, min_nodes=1, max_nodes=3) == 0
-    assert executor._bounded_delta("scale_in", 2, current_nodes=5, min_nodes=1, max_nodes=6) == 2
+    assert executor._bounded_delta("scale_in", 1, current_nodes=2, min_nodes=1, max_nodes=3) == 1
+    assert executor._bounded_delta("scale_in", 4, current_nodes=5, min_nodes=1, max_nodes=6) == 4
+    assert executor._max_css_data_scale_in_delta(current_nodes=6, requested_delta=3) == 2
+
+
+def test_css_half_shrink_error_detection():
+    class Error:
+        error_code = "CSS.0001"
+        error_msg = '{"externalMessage":"the reduced instances number has exceeded the half of the size of data instances"}'
+
+        def __str__(self):
+            return self.error_msg
+
+    assert _is_data_half_shrink_error(Error())
 
 
 def test_client_zero_to_one_allowed_for_independent_add():

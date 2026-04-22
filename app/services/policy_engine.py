@@ -7,6 +7,11 @@ from datetime import datetime, time, timezone
 
 from app.config import Settings
 from app.models.actions import ActionRequest, ChangePlan
+from app.services.strategy_profile import (
+    effective_max_scaling_actions_per_day,
+    effective_scale_in_low_load_minutes,
+    effective_scale_out_observation_minutes,
+)
 
 
 @dataclass(frozen=True)
@@ -121,24 +126,31 @@ def build_change_plan(
     if request.action == "scale_in":
         risk_level = "medium"
         risk_reasons.append("scale-in removes capacity and can affect active traffic")
-        pre_checks.append(f"low load sustained for at least {settings.scale_in_low_load_minutes} minutes")
-        if low_load_minutes and low_load_minutes < settings.scale_in_low_load_minutes:
+        required_low_load = effective_scale_in_low_load_minutes(settings)
+        pre_checks.append(f"low load sustained for at least {required_low_load} minutes")
+        if low_load_minutes and low_load_minutes < required_low_load:
             risk_level = "high"
             risk_reasons.append("low-load observation window is not long enough")
 
     if request.node_type == "ess":
         if request.action == "scale_in":
-            risk_level = "high"
-            maintenance_required = True
-            approval_required = True
-            risk_reasons.append("data-node scale-in may trigger shard relocation")
-            pre_checks.extend(["disk watermarks are safe", "relocating shards are zero", "pending tasks are zero"])
+            risk_level = "medium"
+            risk_reasons.append("data-node scale-in may trigger shard relocation and must pass capacity checks")
+            pre_checks.extend(
+                [
+                    "disk watermarks are safe",
+                    "relocating shards are zero",
+                    "pending tasks are zero",
+                    "capacity analysis does not block data scale-in",
+                ]
+            )
             post_checks.extend(["shard relocation is complete", "disk and JVM pressure remain healthy"])
             if capacity_blocks_data_scale_in(capacity_analysis):
+                risk_level = "high"
                 risk_reasons.append("capacity analysis blocks data-node scale-in")
         elif request.action == "scale_out":
-            risk_level = "medium"
-            risk_reasons.append("data-node scale-out can trigger shard rebalance")
+            risk_level = "low"
+            risk_reasons.append("data-node scale-out is the primary elasticity path")
 
     if request.node_type == "ess-master":
         risk_level = "high"
@@ -179,24 +191,27 @@ def evaluate_enterprise_guards(
     capacity_analysis: object | None,
     now: datetime,
 ) -> tuple[str, str]:
-    if recent_action_count >= settings.max_scaling_actions_per_day:
+    max_actions = effective_max_scaling_actions_per_day(settings)
+    if recent_action_count >= max_actions:
         return "blocked", "Daily scaling action limit reached."
 
-    if request.action == "scale_in" and low_load_minutes < settings.scale_in_low_load_minutes:
+    required_low_load = effective_scale_in_low_load_minutes(settings)
+    if request.action == "scale_in" and low_load_minutes < required_low_load:
         return (
             "approval_required",
-            f"Scale-in requires {settings.scale_in_low_load_minutes} minutes of low-load evidence.",
+            f"Scale-in requires {required_low_load} minutes of low-load evidence.",
         )
 
     if request.node_type == "ess" and request.action == "scale_in" and capacity_blocks_data_scale_in(capacity_analysis):
         return "blocked", "OpenSearch capacity analysis blocks data-node scale-in due to shard or skew risk."
 
     if request.action == "scale_out" and last_action_time:
+        observation_minutes = effective_scale_out_observation_minutes(settings)
         elapsed = (now - last_action_time).total_seconds() / 60
-        if elapsed < settings.scale_out_observation_minutes:
+        if elapsed < observation_minutes:
             return (
                 "blocked",
-                f"Scale-out observation window active for {settings.scale_out_observation_minutes} minutes.",
+                f"Scale-out observation window active for {observation_minutes} minutes.",
             )
 
     if request.change_plan.maintenance_window_required and not is_in_maintenance_window(

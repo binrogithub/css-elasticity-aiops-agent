@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 
 from app.models.metrics import MetricsSnapshot
-from app.nodes.collect_metrics import merge_realtime_opensearch_metrics
+from app.nodes.collect_metrics import merge_realtime_node_metrics, merge_realtime_opensearch_metrics
 
 
 def test_realtime_opensearch_metrics_override_stale_cloud_eye_qps():
@@ -29,3 +29,18 @@ def test_realtime_opensearch_metrics_override_stale_cloud_eye_qps():
     assert merged.search_queue == 2
     assert merged.search_rejected == 3
     assert "realtime_qps=1000.0" in summary
+
+
+def test_realtime_node_metrics_merge_data_cpu_and_heap():
+    snapshot = MetricsSnapshot(cpu_avg=0, jvm_heap_avg=20)
+    nodes = [
+        {"node.role": "dimr", "cpu": "24", "heap.percent": "60"},
+        {"node.role": "dimr", "cpu": "30", "heap.percent": "50"},
+        {"node.role": "ir", "cpu": "99", "heap.percent": "70"},
+    ]
+
+    merged, summary = merge_realtime_node_metrics(snapshot, nodes)
+
+    assert merged.cpu_avg == 27
+    assert merged.jvm_heap_avg == 55
+    assert "Data nodes=2" in summary

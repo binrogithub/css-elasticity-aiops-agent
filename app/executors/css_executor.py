@@ -199,6 +199,36 @@ class CSSExecutor(ElasticityExecutor):
             )
         except exceptions.ClientRequestException as exc:
             message = f"CSS API request failed: {exc.status_code} {exc.error_code} {exc.error_msg}"
+            if request.action == "scale_in" and node_type == "ess" and _is_data_half_shrink_error(exc):
+                retry_delta = self._max_css_data_scale_in_delta(previous_count, applied_delta)
+                if 0 < retry_delta < applied_delta:
+                    try:
+                        self._scale_in(node_type, retry_delta)
+                        return ActionResult(
+                            action_id=request.action_id,
+                            requested_action=request.action,
+                            executed_action=request.action,
+                            node_type=node_type,
+                            requested_delta=request.delta,
+                            applied_delta=retry_delta,
+                            previous_node_count=previous_count,
+                            new_node_count=previous_count - retry_delta,
+                            status="success",
+                            phase="submitted",
+                            message=(
+                                "CSS rejected the requested Data scale-in delta because it exceeded the "
+                                f"provider half-size limit. Retried with applied_delta={retry_delta}; "
+                                "remaining scale-in should be handled by a later workflow cycle after stabilization."
+                            ),
+                            expected_duration_minutes=request.expected_duration_minutes,
+                            started_at=started_at,
+                            finished_at=datetime.now(timezone.utc),
+                        )
+                    except exceptions.ClientRequestException as retry_exc:
+                        message = (
+                            f"{message}. Retry with provider-safe Data scale-in delta={retry_delta} also failed: "
+                            f"{retry_exc.status_code} {retry_exc.error_code} {retry_exc.error_msg}"
+                        )
             if "CSS.5042" in str(exc.error_msg) and node_type == "ess-client":
                 message = (
                     f"{message}. CSS returned CSS.5042 while scaling ess-client. "
@@ -381,14 +411,13 @@ class CSSExecutor(ElasticityExecutor):
             return min(requested, max(0, max_nodes - current_nodes))
         if action == "scale_in":
             allowed = max(0, current_nodes - min_nodes)
-            if self.settings.css_node_type == "ess":
-                allowed = min(allowed, self._max_data_nodes_removable(current_nodes))
             return min(requested, allowed)
         return 0
 
-    def _max_data_nodes_removable(self, current_nodes: int) -> int:
-        """CSS rejects normal data-node shrink batches that remove half or more of data nodes."""
-        return max(0, ((current_nodes - 1) // 2))
+    def _max_css_data_scale_in_delta(self, current_nodes: int, requested_delta: int) -> int:
+        # CSS rejects reducing half or more of the current Data instances in one request.
+        provider_limit = max(0, (current_nodes - 1) // 2)
+        return min(max(0, requested_delta), provider_limit)
 
     def _scale_out(self, node_type: str, delta: int, target_flavor_id: str | None = None) -> None:
         current = len(self._target_instances(self._get_cluster_runtime_state(), node_type))
@@ -476,3 +505,14 @@ class CSSExecutor(ElasticityExecutor):
         if "master" in text:
             return "ess-master"
         return "ess"
+
+
+def _is_data_half_shrink_error(exc: exceptions.ClientRequestException) -> bool:
+    message = " ".join(
+        [
+            str(getattr(exc, "error_code", "")),
+            str(getattr(exc, "error_msg", "")),
+            str(exc),
+        ]
+    ).lower()
+    return "css.0001" in message and "reduced" in message and "half" in message
